@@ -58,6 +58,13 @@ class AnalyzePageTool(WebNavigatorTool):
     name: str = "analyze_page"
     description: str = "Analyze the content of a web page to determine its relevance and extract key information"
     
+    def _run(
+        self,
+        page: WebPage,
+        run_manager: Optional[CallbackManagerForToolRun] = None
+    ) -> Dict[str, Any]:
+        raise NotImplementedError("AnalyzePageTool only supports async execution")
+    
     async def _arun(
         self,
         page: WebPage,
@@ -75,10 +82,25 @@ class ExtractLinksTool(WebNavigatorTool):
         run_manager: Optional[CallbackManagerForToolRun] = None
     ) -> List[str]:
         return self.navigator._extract_links(BeautifulSoup(page.html, 'html5lib'), page.url)
+    
+    async def _arun(
+        self,
+        page: WebPage,
+        run_manager: Optional[CallbackManagerForToolRun] = None
+    ) -> List[str]:
+        return self._run(page, run_manager)
 
 class EvaluateRelevanceTool(WebNavigatorTool):
     name: str = "evaluate_relevance"
     description: str = "Evaluate the relevance of a page or link to the current research goal"
+    
+    def _run(
+        self,
+        page: WebPage,
+        research_context: Dict[str, Any],
+        run_manager: Optional[CallbackManagerForToolRun] = None
+    ) -> float:
+        raise NotImplementedError("EvaluateRelevanceTool only supports async execution")
     
     async def _arun(
         self,
