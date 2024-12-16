@@ -55,8 +55,8 @@ class WebNavigatorTool(BaseTool):
         self.navigator = navigator
 
 class AnalyzePageTool(WebNavigatorTool):
-    name = "analyze_page"
-    description = "Analyze the content of a web page to determine its relevance and extract key information"
+    name: str = "analyze_page"
+    description: str = "Analyze the content of a web page to determine its relevance and extract key information"
     
     async def _arun(
         self,
@@ -66,8 +66,8 @@ class AnalyzePageTool(WebNavigatorTool):
         return await self.navigator._analyze_page_content(page)
 
 class ExtractLinksTool(WebNavigatorTool):
-    name = "extract_links"
-    description = "Extract and analyze links from a web page to determine which ones to follow"
+    name: str = "extract_links"
+    description: str = "Extract and analyze links from a web page to determine which ones to follow"
     
     def _run(
         self,
@@ -77,8 +77,8 @@ class ExtractLinksTool(WebNavigatorTool):
         return self.navigator._extract_links(BeautifulSoup(page.html, 'html5lib'), page.url)
 
 class EvaluateRelevanceTool(WebNavigatorTool):
-    name = "evaluate_relevance"
-    description = "Evaluate the relevance of a page or link to the current research goal"
+    name: str = "evaluate_relevance"
+    description: str = "Evaluate the relevance of a page or link to the current research goal"
     
     async def _arun(
         self,
