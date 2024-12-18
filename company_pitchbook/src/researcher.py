@@ -1,27 +1,34 @@
-from typing import Dict, List, Any, Optional
-import asyncio
-import logging
+from typing import Dict, List, Optional, Any
 from datetime import datetime
+import logging
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
-from langchain.tools import Tool
-from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_core.prompts import ChatPromptTemplate
-from duckduckgo_search import DDGS
+from src.web_navigator import WebNavigator
+from src.content_analyzer import ContentAnalyzer
 
-from .web_navigator import WebNavigator
-from .async_research import AsyncResearchTask, AsyncResearchOrchestrator
+class Citation(BaseModel):
+    """Source citation"""
+    url: str = Field(description="URL of the source")
+    title: str = Field(description="Title of the source")
+    snippet: str = Field(description="Relevant snippet from the source")
+    relevance_score: float = Field(default=0.0, description="Relevance score between 0-1")
 
-class ResearchResults(BaseModel):
-    """Container for research results"""
-    company_info: Dict[str, Any] = Field(default_factory=dict)
-    market_analysis: Dict[str, Any] = Field(default_factory=dict)
-    financial_data: Dict[str, Any] = Field(default_factory=dict)
-    competitors: List[Dict[str, Any]] = Field(default_factory=list)
-    news_articles: List[Dict[str, Any]] = Field(default_factory=list)
-    sources: List[Dict[str, str]] = Field(default_factory=list)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    timestamp: datetime = Field(default_factory=datetime.now)
+class CompanyInfo(BaseModel):
+    """Company information"""
+    name: str = Field(description="Company name")
+    description: Optional[str] = Field(None, description="Company description")
+    location: str = Field(description="Company location")
+    website: str = Field(description="Company website")
+    products_services: List[str] = Field(default_factory=list, description="Products and services")
+    market_info: Dict[str, Any] = Field(default_factory=dict, description="Market information")
+    competitors: List[str] = Field(default_factory=list, description="Competitors")
+
+class ResearchResult(BaseModel):
+    """Research result"""
+    company_info: CompanyInfo
+    citations: List[Citation] = Field(default_factory=list)
+    execution_time: float = Field(default=0.0)
 
 class CompanyResearcher:
     """Handles company research using multiple data sources and AI analysis"""
@@ -31,323 +38,231 @@ class CompanyResearcher:
         company_name: str,
         location: str,
         website: str,
-        business_model: str,
-        products_services: str,
-        llm: Optional[ChatOpenAI] = None
+        business_model: Optional[Dict[str, Any]] = None,
+        products_services: Optional[Dict[str, Any]] = None,
+        llm: Optional[ChatOpenAI] = None,
+        max_retries: int = 3
     ):
         self.company_name = company_name
         self.location = location
         self.website = website
-        self.business_model = business_model
-        self.products_services = products_services
+        self.business_model = business_model or {}
+        self.products_services = products_services or {}
         
-        # Initialize LLM if not provided
-        self.llm = llm or ChatOpenAI(
-            temperature=0,
-            model="gpt-4-turbo-preview"
-        )
+        self.llm = llm or ChatOpenAI(temperature=0, model="gpt-4")
+        self.web_navigator = WebNavigator(llm=self.llm, max_retries=max_retries)
+        self.content_analyzer = ContentAnalyzer(llm=self.llm)
+
+    async def _search_web(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+        """Perform web search using WebNavigator"""
+        return await self.web_navigator.search(query, max_results)
+
+    async def _extract_schema_org(self, html: str) -> Dict[str, Any]:
+        """Extract schema.org metadata from HTML"""
+        from bs4 import BeautifulSoup
+        from src.utils.html_parser import HTMLParser
         
-        # Initialize components
-        self.web_navigator = WebNavigator(
-            llm=self.llm,
-            max_retries=3,
-            max_concurrent_requests=5,
-            request_delay=1.0
-        )
-        
-        self.research_orchestrator = AsyncResearchOrchestrator(
-            llm=self.llm,
-            tools=self._create_research_tools()
-        )
-    
-    def _create_research_tools(self) -> List[Tool]:
-        """Create tools for research tasks"""
-        return [
-            Tool(
-                name="search_web",
-                func=self._search_web,
-                description="Search the web for company information"
-            ),
-            Tool(
-                name="analyze_website",
-                func=self._analyze_website,
-                description="Analyze company website content"
-            ),
-            Tool(
-                name="find_news",
-                func=self._find_news,
-                description="Find recent news articles about the company"
-            ),
-            Tool(
-                name="analyze_competitors",
-                func=self._analyze_competitors,
-                description="Analyze company competitors"
-            ),
-            Tool(
-                name="extract_financials",
-                func=self._extract_financials,
-                description="Extract financial information if available"
-            )
-        ]
-    
-    async def _search_web(self, query: str) -> List[Dict[str, Any]]:
-        """Search the web using DuckDuckGo"""
         try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(
-                    query,
-                    region='wt-wt',
-                    safesearch='moderate',
-                    timelimit='y',  # Last year
-                    max_results=10
-                ))
-            return results
+            soup = BeautifulSoup(html, 'html.parser')
+            return HTMLParser.extract_schema_metadata(soup) or {}
         except Exception as e:
-            logging.error(f"Error in web search: {str(e)}")
-            return []
-    
-    async def _analyze_website(self) -> Dict[str, Any]:
-        """Analyze company website using web navigator"""
-        try:
-            research_context = {
-                'company_name': self.company_name,
-                'business_model': self.business_model,
-                'products_services': self.products_services,
-                'objective': 'company_analysis'
-            }
-            
-            results = await self.web_navigator.navigate(
-                start_url=self.website,
-                research_context=research_context,
-                max_pages=10
-            )
-            
-            # Process and structure the results
-            website_analysis = {
-                'overview': {},
-                'products': [],
-                'services': [],
-                'team': [],
-                'technology': [],
-                'customers': [],
-                'locations': []
-            }
-            
-            for url, data in results['extracted_data'].items():
-                # Merge data into appropriate categories
-                for key in website_analysis.keys():
-                    if key in data:
-                        if isinstance(website_analysis[key], list):
-                            website_analysis[key].extend(data[key])
-                        elif isinstance(website_analysis[key], dict):
-                            website_analysis[key].update(data[key])
-            
-            return website_analysis
-            
-        except Exception as e:
-            logging.error(f"Error analyzing website: {str(e)}")
+            logging.error(f"Error extracting schema.org data: {str(e)}")
             return {}
-    
-    async def _find_news(self) -> List[Dict[str, Any]]:
-        """Find and analyze recent news articles"""
+
+    async def research(self) -> ResearchResult:
+        """Perform company research"""
         try:
-            # Search for news
-            query = f"{self.company_name} {self.location} news"
-            news_results = await self._search_web(query)
+            start_time = datetime.now()
+            company_info = await self._initialize_company_info()
+            citations = []
             
-            # Analyze each news article
-            analyzed_news = []
-            for article in news_results:
-                if article['link'] not in self.web_navigator.state.visited_urls:
-                    research_context = {
-                        'company_name': self.company_name,
-                        'objective': 'news_analysis'
-                    }
+            # Try company website first
+            website_content = await self.web_navigator.navigate(
+                url=self.website,
+                research_context={"purpose": "Research company information"},
+                max_pages=5
+            )
+            
+            website_error = website_content.get('error')
+            if website_error:
+                logging.warning(f"Website access error: {website_content.get('error_message')}. Using alternative sources.")
+                # Increase search scope when website is inaccessible
+                await self._enhanced_search_research(company_info, citations)
+            else:
+                # Process website content if available
+                if website_content:
+                    info = await self.content_analyzer.analyze(website_content)
+                    self._update_company_info(company_info, info)
                     
-                    article_analysis = await self.web_navigator.navigate(
-                        start_url=article['link'],
-                        research_context=research_context,
-                        max_pages=1
+                    citations.append(Citation(
+                        url=self.website,
+                        title=self.company_name,
+                        snippet=info.get('description', ''),
+                        relevance_score=1.0
+                    ))
+                
+                # Supplement with search results
+                await self._supplementary_search_research(company_info, citations)
+            
+            # Validate and ensure we have meaningful data
+            if not citations:
+                logging.error("No valid sources found during research")
+                raise ValueError("Unable to gather information from any sources")
+            
+            # Ensure we have at least some basic information
+            if not company_info.get('location') or not company_info.get('products_services'):
+                await self._fallback_search_research(company_info, citations)
+            
+            return ResearchResult(
+                company_info=CompanyInfo(**company_info),
+                citations=citations,
+                execution_time=float((datetime.now() - start_time).total_seconds())
+            )
+            
+        except Exception as e:
+            logging.error(f"Research failed: {str(e)}")
+            raise
+
+    async def _initialize_company_info(self) -> Dict[str, Any]:
+        """Initialize company information structure"""
+        return {
+            'name': self.company_name,
+            'location': self.location,
+            'website': self.website,
+            'products_services': self.products_services.get('main_offerings', []),
+            'market_info': {
+                'business_model': self.business_model,
+                'target_industries': self.business_model.get('target_industries', []),
+                'competitive_advantages': self.business_model.get('competitive_advantages', [])
+            },
+            'competitors': []
+        }
+
+    async def _enhanced_search_research(self, company_info: Dict[str, Any], citations: List[Citation]) -> None:
+        """Perform enhanced search-based research when website is inaccessible"""
+        # Search queries focused on specific information
+        search_queries = [
+            f"{self.company_name} headquarters location office address",
+            f"{self.company_name} products services offerings solutions",
+            f"{self.company_name} business model revenue company type",
+            f"{self.company_name} market position competitors industry"
+        ]
+        
+        for query in search_queries:
+            results = await self.web_navigator.search(query, max_results=5)
+            for result in results:
+                try:
+                    if result['source_type'] in ['business_data', 'professional_network', 'institutional']:
+                        content = await self.web_navigator.navigate(
+                            url=result['link'],
+                            research_context={"purpose": "Research company information"}
+                        )
+                        
+                        if content and not content.get('error'):
+                            info = await self.content_analyzer.analyze(content)
+                            self._update_company_info(company_info, info)
+                            
+                            citations.append(Citation(
+                                url=result['link'],
+                                title=result['title'],
+                                snippet=result['snippet'],
+                                relevance_score=result['relevance_score']
+                            ))
+                except Exception as e:
+                    logging.warning(f"Error processing search result {result['link']}: {str(e)}")
+                    continue
+
+    async def _supplementary_search_research(self, company_info: Dict[str, Any], citations: List[Citation]) -> None:
+        """Perform supplementary search-based research"""
+        search_results = await self.web_navigator.search(
+            f"{self.company_name} company information market competitors",
+            max_results=5
+        )
+        
+        for result in results:
+            try:
+                if result['source_type'] in ['business_data', 'professional_network']:
+                    content = await self.web_navigator.navigate(
+                        url=result['link'],
+                        research_context={"purpose": "Supplement company information"}
                     )
                     
-                    if article_analysis['extracted_data']:
-                        analyzed_news.append({
-                            'title': article['title'],
-                            'url': article['link'],
-                            'date': article.get('date'),
-                            'analysis': article_analysis['extracted_data']
-                        })
-            
-            return analyzed_news
-            
-        except Exception as e:
-            logging.error(f"Error finding news: {str(e)}")
-            return []
-    
-    async def _analyze_competitors(self) -> List[Dict[str, Any]]:
-        """Analyze company competitors"""
-        try:
-            # Create competitor analysis tasks
-            tasks = [
-                AsyncResearchTask(
-                    id="find_competitors",
-                    name="Find Competitors",
-                    description="Find main competitors",
-                    prompt=f"Find main competitors for {self.company_name} in {self.location}",
-                    required_tools=["search_web"]
-                ),
-                AsyncResearchTask(
-                    id="competitor_analysis",
-                    name="Analyze Competitors",
-                    description="Analyze competitor information",
-                    prompt="Analyze each competitor's strengths and weaknesses",
-                    dependencies=["find_competitors"]
-                )
-            ]
-            
-            # Add tasks to orchestrator
-            for task in tasks:
-                self.research_orchestrator.add_task(task)
-            
-            # Execute tasks
-            results = await self.research_orchestrator.execute_all()
-            
-            # Process competitor analysis
-            competitors = []
-            if "find_competitors" in results and "competitor_analysis" in results:
-                competitor_list = results["find_competitors"].content
-                analysis = results["competitor_analysis"].content
-                
-                for competitor in competitor_list:
-                    if isinstance(competitor, dict) and 'name' in competitor:
-                        competitor_data = {
-                            'name': competitor['name'],
-                            'website': competitor.get('website', ''),
-                            'analysis': next(
-                                (a for a in analysis if a['name'] == competitor['name']),
-                                {}
-                            )
-                        }
-                        competitors.append(competitor_data)
-            
-            return competitors
-            
-        except Exception as e:
-            logging.error(f"Error analyzing competitors: {str(e)}")
-            return []
-    
-    async def _extract_financials(self) -> Dict[str, Any]:
-        """Extract financial information if available"""
-        try:
-            # Create financial analysis tasks
-            tasks = [
-                AsyncResearchTask(
-                    id="find_financial_sources",
-                    name="Find Financial Sources",
-                    description="Find sources of financial information",
-                    prompt=f"Find financial information sources for {self.company_name}",
-                    required_tools=["search_web"]
-                ),
-                AsyncResearchTask(
-                    id="extract_financial_data",
-                    name="Extract Financial Data",
-                    description="Extract and analyze financial data",
-                    prompt="Extract key financial metrics and indicators",
-                    dependencies=["find_financial_sources"]
-                )
-            ]
-            
-            # Add tasks to orchestrator
-            for task in tasks:
-                self.research_orchestrator.add_task(task)
-            
-            # Execute tasks
-            results = await self.research_orchestrator.execute_all()
-            
-            # Process financial data
-            financial_data = {
-                'metrics': {},
-                'analysis': {},
-                'sources': []
-            }
-            
-            if "extract_financial_data" in results:
-                financial_data.update(results["extract_financial_data"].content)
-            
-            return financial_data
-            
-        except Exception as e:
-            logging.error(f"Error extracting financials: {str(e)}")
-            return {}
-    
-    async def research(self) -> ResearchResults:
-        """Conduct comprehensive company research"""
-        try:
-            # Create research tasks
-            tasks = [
-                AsyncResearchTask(
-                    id="website_analysis",
-                    name="Website Analysis",
-                    description="Analyze company website",
-                    prompt=f"Analyze website content for {self.company_name}",
-                    required_tools=["analyze_website"]
-                ),
-                AsyncResearchTask(
-                    id="news_analysis",
-                    name="News Analysis",
-                    description="Analyze recent news",
-                    prompt=f"Find and analyze recent news about {self.company_name}",
-                    required_tools=["find_news"]
-                ),
-                AsyncResearchTask(
-                    id="competitor_analysis",
-                    name="Competitor Analysis",
-                    description="Analyze competitors",
-                    prompt=f"Analyze competitors of {self.company_name}",
-                    required_tools=["analyze_competitors"]
-                ),
-                AsyncResearchTask(
-                    id="financial_analysis",
-                    name="Financial Analysis",
-                    description="Analyze financials",
-                    prompt=f"Analyze financial information for {self.company_name}",
-                    required_tools=["extract_financials"]
-                )
-            ]
-            
-            # Add tasks to orchestrator
-            for task in tasks:
-                self.research_orchestrator.add_task(task)
-            
-            # Execute all research tasks
-            results = await self.research_orchestrator.execute_all()
-            
-            # Compile research results
-            research_results = ResearchResults(
-                company_info={
-                    'name': self.company_name,
-                    'location': self.location,
-                    'website': self.website,
-                    'business_model': self.business_model,
-                    'products_services': self.products_services,
-                    **results.get('website_analysis', {}).get('content', {})
-                },
-                market_analysis=results.get('market_analysis', {}).get('content', {}),
-                financial_data=results.get('financial_analysis', {}).get('content', {}),
-                competitors=results.get('competitor_analysis', {}).get('content', []),
-                news_articles=results.get('news_analysis', {}).get('content', []),
-                sources=[
-                    {'url': url, 'type': 'website'}
-                    for url in self.web_navigator.state.visited_urls
-                ],
-                metadata={
-                    'execution_summary': self.research_orchestrator.get_execution_summary(),
-                    'navigation_paths': self.web_navigator.state.page_cache
-                }
-            )
-            
-            return research_results
-            
-        except Exception as e:
-            logging.error("Error in research process", exc_info=True)
-            raise
+                    if content and not content.get('error'):
+                        info = await self.content_analyzer.analyze(content)
+                        self._update_company_info(company_info, info)
+                        
+                        citations.append(Citation(
+                            url=result['link'],
+                            title=result['title'],
+                            snippet=result['snippet'],
+                            relevance_score=result['relevance_score']
+                        ))
+            except Exception as e:
+                logging.warning(f"Error processing supplementary result {result['link']}: {str(e)}")
+                continue
+
+    async def _fallback_search_research(self, company_info: Dict[str, Any], citations: List[Citation]) -> None:
+        """Perform fallback search for missing critical information"""
+        missing_info_queries = []
+        
+        if not company_info.get('location'):
+            missing_info_queries.append(f"{self.company_name} headquarters location address")
+        
+        if not company_info.get('products_services'):
+            missing_info_queries.append(f"{self.company_name} main products services offerings")
+        
+        for query in missing_info_queries:
+            results = await self.web_navigator.search(query, max_results=3)
+            for result in results:
+                try:
+                    content = await self.web_navigator.navigate(
+                        url=result['link'],
+                        research_context={"purpose": "Find missing critical information"}
+                    )
+                    
+                    if content and not content.get('error'):
+                        info = await self.content_analyzer.analyze(content)
+                        self._update_company_info(company_info, info)
+                        
+                        citations.append(Citation(
+                            url=result['link'],
+                            title=result['title'],
+                            snippet=result['snippet'],
+                            relevance_score=result['relevance_score']
+                        ))
+                except Exception as e:
+                    logging.warning(f"Error in fallback search {result['link']}: {str(e)}")
+                    continue
+
+    def _update_company_info(self, company_info: Dict[str, Any], info: Dict[str, Any]) -> None:
+        """Update company information with new data"""
+        if info.get('description'):
+            company_info['description'] = info['description']
+        
+        # Update location information
+        if info.get('location'):
+            if isinstance(info['location'], dict):
+                company_info['location'] = info['location']
+            elif isinstance(info['location'], str):
+                company_info['location'] = {'headquarters': info['location'], 'offices': [], 'regions': []}
+        
+        # Update products/services with deduplication
+        if info.get('products_services'):
+            if isinstance(info['products_services'], list):
+                current_products = set(company_info['products_services'])
+                new_products = set(info['products_services'])
+                company_info['products_services'] = list(current_products | new_products)
+            elif isinstance(info['products_services'], dict):
+                for key, value in info['products_services'].items():
+                    if key not in company_info['products_services']:
+                        company_info['products_services'][key] = value
+        
+        # Update market info
+        if info.get('market_info'):
+            company_info['market_info'].update(info['market_info'])
+        
+        # Update competitors with deduplication
+        if info.get('competitors'):
+            current_competitors = set(company_info['competitors'])
+            new_competitors = set(info['competitors'])
+            company_info['competitors'] = list(current_competitors | new_competitors)
